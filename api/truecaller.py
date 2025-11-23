@@ -1,221 +1,268 @@
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
+from urllib.request import Request, build_opener, HTTPCookieProcessor
+import http.cookiejar as cookiejar
 import json
 import os
 import pickle
 import re
-import requests
-from bs4 import BeautifulSoup
 
 # --------------------------
 # CONFIG
 # --------------------------
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "truecaller_cookies.pkl")
 
-def load_cookies_into_session(session):
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+# ---------- Cookie / HTTP helpers ----------
+
+def build_opener_with_cookies():
     """
-    Load Selenium-exported cookies (pickled list of dicts) into a requests session.
+    Build a urllib opener with cookies loaded from Selenium-exported pickle.
+    Cookies are expected as a list of dicts: [{'name': ..., 'value': ..., 'domain': ..., 'path': ...}, ...]
     """
+    cj = cookiejar.CookieJar()
+
     if not os.path.exists(COOKIE_FILE):
         raise FileNotFoundError(f"{COOKIE_FILE} not found on server")
 
-    with open(COOKIE_FILE, 'rb') as f:
+    with open(COOKIE_FILE, "rb") as f:
         cookies_list = pickle.load(f)
 
-    for cookie in cookies_list:
-        session.cookies.set(
-            cookie.get("name"),
-            cookie.get("value"),
-            domain=cookie.get("domain")
+    for c in cookies_list:
+        name = c.get("name")
+        value = c.get("value")
+        domain = c.get("domain") or ""
+        path = c.get("path") or "/"
+        secure = bool(c.get("secure", False))
+        expires = c.get("expiry")
+
+        if not name:
+            continue
+
+        ck = cookiejar.Cookie(
+            version=0,
+            name=name,
+            value=value,
+            port=None,
+            port_specified=False,
+            domain=domain,
+            domain_specified=bool(domain),
+            domain_initial_dot=domain.startswith("."),
+            path=path,
+            path_specified=True,
+            secure=secure,
+            expires=expires,
+            discard=False,
+            comment=None,
+            comment_url=None,
+            rest={},
+            rfc2109=False,
         )
+        cj.set_cookie(ck)
+
+    opener = build_opener(HTTPCookieProcessor(cj))
+    return opener
 
 
-def parse_full_profile(html_content, phone_input):
-    """
-    Parses: Name, Image, Email (vCard), Location, Spam Score, & Business Tags
-    (adapted from your original script)
-    """
-    soup = BeautifulSoup(html_content, 'html.parser')
+def http_get(url, timeout=15):
+    opener = build_opener_with_cookies()
+    req = Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.truecaller.com/",
+        },
+    )
+    resp = opener.open(req, timeout=timeout)
+    body = resp.read().decode("utf-8", errors="ignore")
+    status = resp.getcode()
+    return status, body
 
+
+# ---------- Parsing helpers (no BeautifulSoup) ----------
+
+def strip_tags(html: str) -> str:
+    """Remove HTML tags to get a plain-text dump."""
+    text = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def parse_full_profile(html_content: str, phone_input: str):
     data = {
         "phone": phone_input,
         "name": None,
-        "alt_name": None,        # Bracket wala naam eg: ( Tdp )
-        "email": None,           # vCard se
+        "alt_name": None,
+        "email": None,
         "location": "Unknown",
         "carrier": "Unknown",
-        "image_url": None,       # Profile Pic
-        "type": "Person",        # Business / Spam / Person
+        "image_url": None,
+        "type": "Person",
         "spam_score": None,
-        "status": "Success"
+        "status": "Success",
     }
 
-    text_dump = soup.get_text(" ", strip=True)
+    text_dump = strip_tags(html_content)
+    lower_text = text_dump.lower()
 
-    # 1. vCARD extraction
+    # --- 1. vCard extraction ---
     try:
-        vcard_match = re.search(r'href="(data:text/vcard;charset=utf-8,[^"]+)"', html_content)
+        vcard_match = re.search(
+            r'href="(data:text/vcard;charset=utf-8,[^"]+)"',
+            html_content,
+            flags=re.IGNORECASE,
+        )
         if vcard_match:
             raw_vcard = unquote(vcard_match.group(1))
 
-            fn_match = re.search(r'FN:(.+)', raw_vcard)
+            fn_match = re.search(r"\nFN:(.+)", raw_vcard)
             if fn_match:
                 data["name"] = fn_match.group(1).strip()
 
-            email_match = re.search(r'EMAIL:(.+)', raw_vcard)
+            email_match = re.search(r"\nEMAIL:(.+)", raw_vcard)
             if email_match:
                 data["email"] = email_match.group(1).strip()
 
-            adr_match = re.search(r'ADR.*?:(.*)', raw_vcard)
+            adr_match = re.search(r"\nADR.*?:(.*)", raw_vcard)
             if adr_match:
-                raw_loc = adr_match.group(1).replace(';', ' ').strip()
+                raw_loc = adr_match.group(1).replace(";", " ").strip()
                 if raw_loc:
                     data["location"] = raw_loc
-
-            # ORG check is usually for business, but HTML double-check is better
     except Exception as e:
-        # Don’t crash; just continue with other methods
         data["vcard_error"] = str(e)
 
-    # 2. HTML visual parsing
+    # --- 2. Profile image ---
+    img_matches = re.findall(
+        r'<img[^>]+src=["\']([^"\']+)["\']',
+        html_content,
+        flags=re.IGNORECASE,
+    )
+    for src in img_matches:
+        if any(k in src for k in ("myview", "googleusercontent", "facebook")) and "user.svg" not in src:
+            data["image_url"] = src
+            break
 
-    # A. Profile Image
-    img_tags = soup.find_all('img')
-    for img in img_tags:
-        src = img.get('src', '')
-        if "myview" in src or "googleusercontent" in src or "facebook" in src:
-            if "user.svg" not in src:  # Skip default icon
-                data["image_url"] = src
-                break
-
-    # B. Name fallback
+    # --- 3. Name fallback (font-bold) ---
     if not data["name"]:
-        bold_divs = soup.find_all(['div', 'span'], class_=lambda x: x and 'font-bold' in x)
-        for b in bold_divs:
-            txt = b.get_text(strip=True)
-            if len(txt) > 2 and "Truecaller" not in txt and "Search" not in txt:
-                data["name"] = txt
-                break
+        m = re.search(
+            r"<(div|span)[^>]*class=[\"'][^\"']*font-bold[^\"']*[\"'][^>]*>(.*?)</\1>",
+            html_content,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            # Strip inner tags
+            inner = re.sub(r"<[^>]+>", " ", m.group(2))
+            inner = re.sub(r"\s+", " ", inner).strip()
+            if inner and "truecaller" not in inner.lower():
+                data["name"] = inner
 
-    # Alt name in brackets
-    opacity_divs = soup.find_all('div', class_=lambda x: x and 'opacity-75' in x)
-    for op in opacity_divs:
-        txt = op.get_text(strip=True)
-        if "(" in txt and ")" in txt:
-            data["alt_name"] = txt
+    # --- 4. Alt name (opacity-75) ---
+    m_alt = re.search(
+        r"<div[^>]*class=[\"'][^\"']*opacity-75[^\"']*[\"'][^>]*>(.*?)</div>",
+        html_content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m_alt:
+        inner = re.sub(r"<[^>]+>", " ", m_alt.group(1))
+        inner = re.sub(r"\s+", " ", inner).strip()
+        if "(" in inner and ")" in inner:
+            data["alt_name"] = inner
 
-    # C. Spam / Business
-    if "Likely a business" in text_dump:
+    # --- 5. Type / spam ---
+    if "likely a business" in lower_text:
         data["type"] = "Likely a Business"
-    elif "spam" in text_dump.lower():
-        count = re.search(r'(\d+)\s*spam', text_dump.lower())
+    elif "spam" in lower_text:
+        count = re.search(r"(\d+)\s*spam", lower_text)
         if count:
             data["spam_score"] = f"Reported {count.group(1)} times"
         else:
             data["spam_score"] = "Yes, Reported as Spam"
 
-    # D. Carrier
+    # --- 6. Carrier detection ---
     if data["carrier"] == "Unknown":
-        carriers = ['Airtel', 'Jio', 'Vi', 'Vodafone', 'Idea', 'BSNL', 'MTNL']
+        carriers = ["Airtel", "Jio", "Vi", "Vodafone", "Idea", "BSNL", "MTNL"]
         for c in carriers:
-            if c in text_dump:
+            if c.lower() in lower_text:
                 data["carrier"] = c
                 break
 
     return data
 
 
+# ---------- Core lookup ----------
+
 def lookup_number(raw_phone: str):
-    """
-    Core lookup function: takes raw phone string, cleans + normalizes, queries Truecaller,
-    returns structured JSON dict or error.
-    """
-    # clean to digits
-    phone_num = re.sub(r'[^\d]', '', raw_phone or "")
+    phone_num = re.sub(r"[^\d]", "", raw_phone or "")
 
     if not phone_num:
-        return {
-            "status": "Error",
-            "error": "Phone number is required"
-        }
+        return {"status": "Error", "error": "Phone number is required"}
 
-    # If only 10 digits, assume Indian number and prepend 91
+    # If 10 digits, assume Indian mobile and prepend 91
     if not phone_num.startswith("91") and len(phone_num) == 10:
         phone_num = "91" + phone_num
 
-    target_url = f"https://www.truecaller.com/search/in/{phone_num}"
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.truecaller.com/",
-    })
+    url = f"https://www.truecaller.com/search/in/{phone_num}"
 
     try:
-        load_cookies_into_session(session)
+        status_code, html = http_get(url)
     except FileNotFoundError as e:
         return {
             "status": "Error",
             "error": "Cookie file missing on server. Upload truecaller_cookies.pkl beside this file.",
-            "details": str(e)
+            "details": str(e),
         }
-    except Exception as e:
-        return {
-            "status": "Error",
-            "error": "Failed to load cookies into session",
-            "details": str(e)
-        }
-
-    try:
-        response = session.get(target_url, timeout=15)
     except Exception as e:
         return {
             "status": "Error",
             "error": "Request to Truecaller failed",
-            "details": str(e)
+            "details": str(e),
         }
 
-    if response.status_code == 200:
-        text_lower = response.text.lower()
-        if "sign in" in text_lower and "unlock" in text_lower:
+    if status_code == 200:
+        lower_html = html.lower()
+        if "sign in" in lower_html and "unlock" in lower_html:
             return {
                 "status": "Error",
-                "error": "Login expired or IP blocked by Truecaller"
+                "error": "Login expired or IP blocked by Truecaller",
             }
+        return parse_full_profile(html, phone_num)
 
-        result = parse_full_profile(response.text, phone_num)
-        return result
-
-    elif response.status_code == 404:
+    if status_code == 404:
         return {
             "status": "NotFound",
             "error": "Number not found in Truecaller database",
-            "phone": phone_num
+            "phone": phone_num,
         }
-    elif response.status_code == 403:
+
+    if status_code == 403:
         return {
             "status": "Forbidden",
             "error": "403 Blocked (WAF or IP blocked)",
-            "phone": phone_num
-        }
-    else:
-        return {
-            "status": "Error",
-            "error": f"Unexpected HTTP status code: {response.status_code}",
-            "phone": phone_num
+            "phone": phone_num,
         }
 
+    return {
+        "status": "Error",
+        "error": f"Unexpected HTTP status code: {status_code}",
+        "phone": phone_num,
+    }
+
+
+# ---------- Vercel handler ----------
 
 class handler(BaseHTTPRequestHandler):
     """
-    Vercel Python Serverless Function handler.
-    Endpoint example:
+    Endpoint examples:
       GET /api/truecaller?phone=9199XXXXXXXX
       GET /api/truecaller?mobile=99XXXXXXXXXX
     """
@@ -225,14 +272,12 @@ class handler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        # CORS (optional, but useful if you call from frontend)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
-        # Handle CORS preflight if needed
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -243,28 +288,26 @@ class handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        # Accept both ?phone= and ?mobile=
-        phone = (
-            qs.get("phone", [None])[0]
-            or qs.get("mobile", [None])[0]
-        )
+        phone = qs.get("phone", [None])[0] or qs.get("mobile", [None])[0]
 
         if not phone:
-            self._send_json(400, {
-                "status": "Error",
-                "error": "Query param 'phone' or 'mobile' is required, e.g. /api/truecaller?phone=9199XXXXXXXX"
-            })
+            self._send_json(
+                400,
+                {
+                    "status": "Error",
+                    "error": "Query param 'phone' or 'mobile' is required, e.g. /api/truecaller?phone=9199XXXXXXXX",
+                },
+            )
             return
 
         result = lookup_number(phone)
 
-        # Decide HTTP status based on result
-        if result.get("status") == "Success":
+        status = result.get("status")
+        if status == "Success":
             self._send_json(200, result)
-        elif result.get("status") == "NotFound":
+        elif status == "NotFound":
             self._send_json(404, result)
-        elif result.get("status") == "Forbidden":
+        elif status == "Forbidden":
             self._send_json(403, result)
         else:
-            # Generic error
             self._send_json(500, result)
