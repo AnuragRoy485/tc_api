@@ -1,7 +1,7 @@
 {
   "functions": {
-    "api/truecaller.py": {
-      "runtime": "@vercel/python@3.0.0"
+    "api/*.py": {
+      "runtime": "@vercel/python@3.1.0"
     }
   }
 }
